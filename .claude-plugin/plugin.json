@@ -1,0 +1,1 @@
+{ "name": "omok-explorer", "version": "0.1.0", "description": "Project file explorer pane for /omok", "types": "./types/index.d.ts" }
