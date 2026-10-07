@@ -2,6 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Row } from '../types'
+import { BUBBLE_COLS, CHAR_COLS, CHAR_ROWS, MOODS, SP, SPEED, bubble, frame, moodOf, paint, stepPos } from './crawl'
+import type { Mood } from './crawl'
 
 const PANE = 'omok-explorer'
 const HIDDEN = new Set(['.git', '__pycache__', 'node_modules', '.omc'])
@@ -11,6 +13,10 @@ const busy = atom({ plugin: 'omok-explorer', key: 'busy' } as const, false)
 const tick = atom({ plugin: 'omok-explorer', key: 'tick' } as const, 0)
 const top = atom({ plugin: 'omok-explorer', key: 'top' } as const, 0)
 const pos = atom({ plugin: 'omok-explorer', key: 'pos' } as const, { x: 0, dir: 0, hold: 0 })
+// What crawl is doing; `until` (clock ms) ends a passing mood such as error or done, 0 keeps it.
+const mood = atom({ plugin: 'omok-explorer', key: 'mood' } as const, { mood: 'rest', until: 0 })
+// A mood pinned with /crawl, or '' to follow Claude.
+const pinned = atom({ plugin: 'omok-explorer', key: 'pinned' } as const, '')
 const rows = atom({ plugin: 'omok-explorer', key: 'rows' } as const, [] as Row[])
 
 const build = async ($: any, expanded: string[]): Promise<Row[]> => {
@@ -39,102 +45,26 @@ const refresh = async ($: any) => {
   await update($, rows, () => next)
 }
 
-const SP = '\u00A0'
-const BODY_COLOR = '#FF3B1D'
-const DARK = '#141413'
-const CHAR_ROWS = 5
 const MIN_WIDTH = 28
 
-// Clawd as pixel art, 12 columns by 9 rows, drawn at half size: one terminal column per pixel,
-// two pixel rows per terminal row (half blocks).
-// # body, E eye, e shut eye, . empty. Taken from claude.dev/shared/img/clawd-mark.png.
-const BODY = [
-  '..########..',
-  '..#E####E#..',
-  '############',
-  '############',
-  '..########..',
-  '..########..',
-]
-const SHUT = [BODY[0], '..#e####e#..', ...BODY.slice(2)]
-const LEGS = '..#.#..#.#..'
-const LEFT_UP = ['..#.#..#.#..', '.......#.#..']
-const RIGHT_UP = ['..#.#..#.#..', '..#.#.......']
-const BOTH = [LEGS, LEGS]
-const GAP = '............'
-
-const STOMP: string[][] = [
-  [GAP, ...BODY, ...LEFT_UP],
-  [...BODY, ...BOTH, GAP],
-  [GAP, ...BODY, ...RIGHT_UP],
-  [...BODY, ...BOTH, GAP],
-]
-// Resting: the same body and four legs as the mark, squatting one row lower, legs a row short.
-// Walking: the squat again, the two leg pairs swinging apart and together.
-const STRIDE_A = '.#.#....#.#.'
-const STRIDE_B = '...#.##.#...'
-const WALK: string[][] = [STRIDE_A, LEGS, STRIDE_B, LEGS].map(legs => [GAP, GAP, ...BODY, legs])
-const REST: string[][] = [
-  [GAP, GAP, ...BODY, LEGS],
-  [GAP, GAP, ...SHUT, LEGS],
-]
-
-const PX: Record<string, string | undefined> = { '#': BODY_COLOR, E: DARK, e: BODY_COLOR, '.': undefined }
-
-type Span = { text: string; fg?: string; bg?: string }
-
-// Pairs pixel rows into terminal rows: top pixel as the upper half block, bottom as the lower.
-const paint = (art: string[]): Span[][] => {
-  const px = art.length % 2 ? [...art, GAP] : art
-  const out: Span[][] = []
-  for (let y = 0; y < px.length; y += 2) {
-    const line: Span[] = []
-    for (let x = 0; x < px[y].length; x++) {
-      const a = px[y][x]
-      const b = px[y + 1][x]
-      const t = PX[a]
-      const u = PX[b]
-      const cell: { ch: string; fg?: string; bg?: string } =
-        a === 'e' || b === 'e'
-          ? { ch: '▁', fg: DARK, bg: BODY_COLOR }
-          : t === u
-            ? { ch: SP, bg: t }
-            : !t
-              ? { ch: '▄', fg: u }
-              : !u
-                ? { ch: '▀', fg: t }
-                : { ch: '▀', fg: t, bg: u }
-      const last = line[line.length - 1]
-      if (last && last.fg === cell.fg && last.bg === cell.bg) last.text += cell.ch
-      else line.push({ text: cell.ch, fg: cell.fg, bg: cell.bg })
-    }
-    out.push(line)
-  }
-  return out
-}
-
-const CHAR_COLS = 12
+// How long the passing moods last, in ms.
+const ERROR_MS = 4000
+const DONE_MS = 3500
 
 // Widest offset the character may walk to; the render keeps it in step with the pane width.
 let limit = 0
 
-// One random step: stand still, start walking either way, turn around, or stop and hold for a few ticks.
-const stepPos = (p: { x: number; dir: number; hold: number }, max: number, speed: number) => {
-  let { dir } = p
-  const x = Math.min(p.x, max)
-  if (p.hold > 0) return { x, dir: 0, hold: p.hold - 1 }
-  const r = Math.random()
-  if (dir === 0) {
-    if (r >= 0.5) return { x, dir: 0, hold: 0 }
-    dir = Math.random() < 0.5 ? -1 : 1
-  } else if (r < 0.15) return { x, dir: 0, hold: 1 + Math.floor(Math.random() * 5) }
-  else if (r < 0.25) dir = -dir
-  let nx = x + dir * speed
-  if (nx < 0 || nx > max) {
-    dir = -dir
-    nx = x + dir * speed
-  }
-  return { x: Math.min(max, Math.max(0, nx)), dir, hold: 0 }
+const moodNow = async ($: any): Promise<Mood> => {
+  const pin = await read($, pinned)
+  if (pin) return pin as Mood
+  const m = await read($, mood)
+  if (m.until && (await $.clock.now()) > m.until) return (await read($, busy)) ? 'think' : 'rest'
+  return m.mood as Mood
+}
+
+const setMood = async ($: any, next: Mood, ms = 0) => {
+  const t = ms ? (await $.clock.now()) + ms : 0
+  await update($, mood, () => ({ mood: next, until: t }))
 }
 
 const show = async ($: any) => {
@@ -147,16 +77,21 @@ let timer: { cancel: () => void } | undefined
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'explorer', description: 'Open the /omok file explorer pane' })
+    await $.command.register({
+      name: 'crawl',
+      description: 'Pin crawl to one move, or follow Claude again',
+      argumentHint: `[${MOODS.join('|')}|auto]`,
+    })
     await refresh($)
     void show($)
     timer?.cancel()
     let n = 0
     timer = $.clock.every(300, () => {
       n += 1
-      void read($, busy).then(isBusy => {
-        if (isBusy || n % 3 === 0) {
+      void Promise.all([read($, busy), moodNow($)]).then(([isBusy, m]) => {
+        if (isBusy || m !== 'rest' || n % 3 === 0) {
           void update($, tick, t => t + 1)
-          void update($, pos, p => stepPos(p, limit, isBusy ? 2 : 1))
+          if (SPEED[m] > 0) void update($, pos, p => stepPos(p, limit, SPEED[m], m !== 'rest'))
         }
       })
     })
@@ -170,13 +105,46 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     await update($, busy, () => true)
+    await setMood($, 'think')
     return next(e)
   })
+
+  // Each tool call sets crawl's move; a failed call makes it dizzy for a moment.
+  on('tool.call', async ($, e, next) => {
+    const started = moodOf(e.tool)
+    await setMood($, started)
+    const ran = await next(e)
+    // Outside a turn (background work, or a straggler after an abort) crawl goes back to rest,
+    // unless something else has taken over since.
+    if (!(await read($, busy))) {
+      if ((await read($, mood)).mood === started) await setMood($, 'rest')
+      return ran
+    }
+    if (ran.deny === undefined && ran.isError === true) await setMood($, 'error', ERROR_MS)
+    else await setMood($, 'think')
+    return ran
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     await update($, busy, () => false)
+    // A failure still on show finishes before anything else.
+    if ((await moodNow($)) === 'error') return done
+    if (e.reason === 'answer') await setMood($, 'done', DONE_MS)
+    else if (e.reason === 'error') await setMood($, 'error', ERROR_MS)
+    else await setMood($, 'rest')
     return done
+  })
+
+  on('command.run', { command: 'crawl' }, async ($, e) => {
+    const want = e.args.trim()
+    if (!want || want === 'auto') {
+      await update($, pinned, () => '')
+      return { text: 'crawl follows Claude again.' }
+    }
+    if (!(MOODS as string[]).includes(want)) return { text: `crawl knows: ${MOODS.join(', ')}, auto.` }
+    await update($, pinned, () => want)
+    return { text: `crawl: ${want}` }
   })
 
   on('command.run', { command: 'explorer' }, async $ => {
@@ -200,16 +168,18 @@ export const register: Register = on => {
       await show($)
     }
 
-    const isBusy = await read($, busy)
     const t = await read($, tick)
     const walker = await read($, pos)
-    const art = isBusy ? STOMP[t % STOMP.length] : walker.dir !== 0 ? WALK[t % WALK.length] : REST[t % REST.length]
+    const m = await moodNow($)
+    // Resting crawl that is on the move walks with the reading gait.
+    const art = frame(m === 'rest' && walker.dir !== 0 ? 'read' : m, t, walker.dir)
+    const say = bubble(m, t)
     const bodyRows = (e.props as { scroll?: { bodyRows?: number } } | undefined)?.scroll?.bodyRows
     const room = Math.max(8, bodyRows ?? (e.viewport?.rows ?? 24) - 4)
     const visible = Math.max(3, room - 1 - CHAR_ROWS - 3)
     const start = Math.min(await read($, top), Math.max(0, list.length - visible))
     const bodyCols = (e.props as { bodyColumns?: number } | undefined)?.bodyColumns ?? cols
-    limit = Math.max(0, bodyCols - 2 - CHAR_COLS)
+    limit = Math.max(0, bodyCols - 2 - CHAR_COLS - BUBBLE_COLS)
     const offset = Math.min(walker.x, limit)
     const clip = (t: string) => (t.length > bodyCols - 1 ? `${t.slice(0, Math.max(1, bodyCols - 2))}…` : t)
     const shown = list.slice(start, start + visible)
@@ -241,7 +211,7 @@ export const register: Register = on => {
           {Array.from({ length: pad }).map(() => (
             <Text> </Text>
           ))}
-          {paint(art).map(row => (
+          {paint(art).map((row, i) => (
             <Box flexWrap="nowrap" flexShrink={0}>
               <Text>{SP.repeat(1 + offset)}</Text>
               {row.map(r => (
@@ -251,6 +221,11 @@ export const register: Register = on => {
                   </Text>
                 </Box>
               ))}
+              {i === 0 && (
+                <Box flexShrink={0}>
+                  <Text bold>{say}</Text>
+                </Box>
+              )}
             </Box>
           ))}
         </Box>
