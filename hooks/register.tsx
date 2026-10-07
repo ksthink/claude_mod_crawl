@@ -10,6 +10,7 @@ const width = atom({ plugin: 'omok-explorer', key: 'width' } as const, 36)
 const busy = atom({ plugin: 'omok-explorer', key: 'busy' } as const, false)
 const tick = atom({ plugin: 'omok-explorer', key: 'tick' } as const, 0)
 const top = atom({ plugin: 'omok-explorer', key: 'top' } as const, 0)
+const pos = atom({ plugin: 'omok-explorer', key: 'pos' } as const, { x: 0, dir: 0, hold: 0 })
 const rows = atom({ plugin: 'omok-explorer', key: 'rows' } as const, [] as Row[])
 
 const build = async ($: any, expanded: string[]): Promise<Row[]> => {
@@ -39,12 +40,13 @@ const refresh = async ($: any) => {
 }
 
 const SP = '\u00A0'
-const ORANGE = '#DA7756'
+const BODY_COLOR = '#FF3B1D'
 const DARK = '#141413'
-const CHAR_ROWS = 9
+const CHAR_ROWS = 5
 const MIN_WIDTH = 28
 
-// Clawd as pixel art, 12 columns, each cell two terminal columns wide:
+// Clawd as pixel art, 12 columns by 9 rows, drawn at half size: one terminal column per pixel,
+// two pixel rows per terminal row (half blocks).
 // # body, E eye, e shut eye, . empty. Taken from claude.dev/shared/img/clawd-mark.png.
 const BODY = [
   '..########..',
@@ -63,24 +65,76 @@ const GAP = '............'
 
 const STOMP: string[][] = [
   [GAP, ...BODY, ...LEFT_UP],
-  [...BODY, GAP, ...BOTH],
+  [...BODY, ...BOTH, GAP],
   [GAP, ...BODY, ...RIGHT_UP],
-  [...BODY, GAP, ...BOTH],
+  [...BODY, ...BOTH, GAP],
 ]
 // Resting: the same body and four legs as the mark, squatting one row lower, legs a row short.
+// Walking: the squat again, the two leg pairs swinging apart and together.
+const STRIDE_A = '.#.#....#.#.'
+const STRIDE_B = '...#.##.#...'
+const WALK: string[][] = [STRIDE_A, LEGS, STRIDE_B, LEGS].map(legs => [GAP, GAP, ...BODY, legs])
 const REST: string[][] = [
   [GAP, GAP, ...BODY, LEGS],
   [GAP, GAP, ...SHUT, LEGS],
 ]
 
-const runs = (row: string) => {
-  const out: { c: string; n: number }[] = []
-  for (const c of row) {
-    const last = out[out.length - 1]
-    if (last && last.c === c) last.n += 1
-    else out.push({ c, n: 1 })
+const PX: Record<string, string | undefined> = { '#': BODY_COLOR, E: DARK, e: BODY_COLOR, '.': undefined }
+
+type Span = { text: string; fg?: string; bg?: string }
+
+// Pairs pixel rows into terminal rows: top pixel as the upper half block, bottom as the lower.
+const paint = (art: string[]): Span[][] => {
+  const px = art.length % 2 ? [...art, GAP] : art
+  const out: Span[][] = []
+  for (let y = 0; y < px.length; y += 2) {
+    const line: Span[] = []
+    for (let x = 0; x < px[y].length; x++) {
+      const a = px[y][x]
+      const b = px[y + 1][x]
+      const t = PX[a]
+      const u = PX[b]
+      const cell: { ch: string; fg?: string; bg?: string } =
+        a === 'e' || b === 'e'
+          ? { ch: '▁', fg: DARK, bg: BODY_COLOR }
+          : t === u
+            ? { ch: SP, bg: t }
+            : !t
+              ? { ch: '▄', fg: u }
+              : !u
+                ? { ch: '▀', fg: t }
+                : { ch: '▀', fg: t, bg: u }
+      const last = line[line.length - 1]
+      if (last && last.fg === cell.fg && last.bg === cell.bg) last.text += cell.ch
+      else line.push({ text: cell.ch, fg: cell.fg, bg: cell.bg })
+    }
+    out.push(line)
   }
   return out
+}
+
+const CHAR_COLS = 12
+
+// Widest offset the character may walk to; the render keeps it in step with the pane width.
+let limit = 0
+
+// One random step: stand still, start walking either way, turn around, or stop and hold for a few ticks.
+const stepPos = (p: { x: number; dir: number; hold: number }, max: number, speed: number) => {
+  let { dir } = p
+  const x = Math.min(p.x, max)
+  if (p.hold > 0) return { x, dir: 0, hold: p.hold - 1 }
+  const r = Math.random()
+  if (dir === 0) {
+    if (r >= 0.5) return { x, dir: 0, hold: 0 }
+    dir = Math.random() < 0.5 ? -1 : 1
+  } else if (r < 0.15) return { x, dir: 0, hold: 1 + Math.floor(Math.random() * 5) }
+  else if (r < 0.25) dir = -dir
+  let nx = x + dir * speed
+  if (nx < 0 || nx > max) {
+    dir = -dir
+    nx = x + dir * speed
+  }
+  return { x: Math.min(max, Math.max(0, nx)), dir, hold: 0 }
 }
 
 const show = async ($: any) => {
@@ -100,7 +154,10 @@ export const register: Register = on => {
     timer = $.clock.every(300, () => {
       n += 1
       void read($, busy).then(isBusy => {
-        if (isBusy || n % 3 === 0) void update($, tick, t => t + 1)
+        if (isBusy || n % 3 === 0) {
+          void update($, tick, t => t + 1)
+          void update($, pos, p => stepPos(p, limit, isBusy ? 2 : 1))
+        }
       })
     })
     return next(e)
@@ -145,12 +202,15 @@ export const register: Register = on => {
 
     const isBusy = await read($, busy)
     const t = await read($, tick)
-    const art = isBusy ? STOMP[t % STOMP.length] : REST[t % REST.length]
+    const walker = await read($, pos)
+    const art = isBusy ? STOMP[t % STOMP.length] : walker.dir !== 0 ? WALK[t % WALK.length] : REST[t % REST.length]
     const bodyRows = (e.props as { scroll?: { bodyRows?: number } } | undefined)?.scroll?.bodyRows
     const room = Math.max(8, bodyRows ?? (e.viewport?.rows ?? 24) - 4)
     const visible = Math.max(3, room - 1 - CHAR_ROWS - 3)
     const start = Math.min(await read($, top), Math.max(0, list.length - visible))
     const bodyCols = (e.props as { bodyColumns?: number } | undefined)?.bodyColumns ?? cols
+    limit = Math.max(0, bodyCols - 2 - CHAR_COLS)
+    const offset = Math.min(walker.x, limit)
     const clip = (t: string) => (t.length > bodyCols - 1 ? `${t.slice(0, Math.max(1, bodyCols - 2))}…` : t)
     const shown = list.slice(start, start + visible)
     const hidden = list.length - shown.length
@@ -181,16 +241,13 @@ export const register: Register = on => {
           {Array.from({ length: pad }).map(() => (
             <Text> </Text>
           ))}
-          {art.map(row => (
+          {paint(art).map(row => (
             <Box flexWrap="nowrap" flexShrink={0}>
-              <Text>{SP}</Text>
-              {runs(row).map(r => (
+              <Text>{SP.repeat(1 + offset)}</Text>
+              {row.map(r => (
                 <Box flexShrink={0}>
-                  <Text
-                    color={r.c === 'e' ? DARK : undefined}
-                    backgroundColor={r.c === '.' ? undefined : r.c === 'E' ? DARK : ORANGE}
-                  >
-                    {r.c === 'e' ? '▁▁'.repeat(r.n) : SP.repeat(r.n * 2)}
+                  <Text color={r.fg} backgroundColor={r.bg}>
+                    {r.text}
                   </Text>
                 </Box>
               ))}
